@@ -28,13 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      # Options PyTest : sortie concise, arrêt au 1er échec, temps lents
       PYTEST_ADDOPTS: "-q -ra --maxfail=1 --durations=10"
-      # Valeur par défaut pour le plugin pytest-timeout si un test n'a pas de marqueur
       PYTEST_TIMEOUT: "120"
-      # Assure les imports relatifs (tests importent `from main import app`)
       PYTHONPATH: "."
-      # Indique l'environnement CI (utile si ton code ajuste LIME en CI)
       CI: "true"
 
     steps:
@@ -50,23 +46,24 @@ jobs:
       - name: Install dependencies (app + test)
         run: |
           python -m pip install --upgrade pip
-          # Dépendances de l'app
           pip install -r requirements.txt
-          # Dépendances de test et explicabilité
           pip install pytest pytest-timeout httpx requests lime
-          # Facultatif mais souvent requis par LIME/scikit-learn
           python - <<'PY'
           try:
-              import sklearn, numpy, scipy, matplotlib  # sanity check
-              print("Deps ML OK")
+              import sklearn, numpy, scipy, matplotlib
+              print("✅ Dépendances ML OK")
           except Exception as e:
-              print("Note: vérifie requirements si besoin:", e)
+              print("⚠️ Vérifie requirements si besoin:", e)
           PY
 
       - name: Afficher versions clés
         run: |
-          python -c "import sys; print('Python:', sys.version)"
-          python -c "import sklearn, lime; print('sklearn:', sklearn.__version__, '| lime:', lime.__version__)"
+          python - <<'PY'
+          import sys, sklearn, lime
+          print("Python :", sys.version)
+          print("scikit-learn :", sklearn.__version__)
+          print("lime :", getattr(lime, "__version__", "version non disponible"))
+          PY
 
       - name: Lint rapide (optionnel non bloquant)
         continue-on-error: true
@@ -137,8 +134,8 @@ jobs:
             echo "Secret RENDER_DEPLOY_HOOK absent"; exit 1
           fi
           curl -fsS -X POST "$RENDER_DEPLOY_HOOK"
-          echo "Redéploiement demandé à Render"
+          echo "🚀 Redéploiement demandé à Render"
 
       - name: Fin
         run: |
-          echo "Déploiement Render déclenché. Surveille le dashboard Render."
+          echo "✅ Déploiement Render déclenché. Surveille ton dashboard Render."
