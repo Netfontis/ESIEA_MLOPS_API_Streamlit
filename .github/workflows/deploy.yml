@@ -1,0 +1,144 @@
+# ============================================
+# CI/CD — Tests → Build → Deploy (Render)
+# ============================================
+
+name: Deploy API
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Évite les déploiements concurrents sur main
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ==========================================
+  # JOB 1 : TESTS
+  # ==========================================
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Options PyTest : sortie concise, arrêt au 1er échec, temps lents
+      PYTEST_ADDOPTS: "-q -ra --maxfail=1 --durations=10"
+      # Valeur par défaut pour le plugin pytest-timeout si un test n'a pas de marqueur
+      PYTEST_TIMEOUT: "120"
+      # Assure les imports relatifs (tests importent `from main import app`)
+      PYTHONPATH: "."
+      # Indique l'environnement CI (utile si ton code ajuste LIME en CI)
+      CI: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies (app + test)
+        run: |
+          python -m pip install --upgrade pip
+          # Dépendances de l'app
+          pip install -r requirements.txt
+          # Dépendances de test et explicabilité
+          pip install pytest pytest-timeout httpx requests lime
+          # Facultatif mais souvent requis par LIME/scikit-learn
+          python - <<'PY'
+          try:
+              import sklearn, numpy, scipy, matplotlib  # sanity check
+              print("Deps ML OK")
+          except Exception as e:
+              print("Note: vérifie requirements si besoin:", e)
+          PY
+
+      - name: Afficher versions clés
+        run: |
+          python -c "import sys; print('Python:', sys.version)"
+          python -c "import sklearn, lime; print('sklearn:', sklearn.__version__, '| lime:', lime.__version__)"
+
+      - name: Lint rapide (optionnel non bloquant)
+        continue-on-error: true
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: Run unit tests (health / predict / explain + timeouts)
+        run: |
+          pytest
+
+      - name: Export JUnit (artifact)
+        if: always()
+        run: |
+          pytest --junitxml=pytest-report.xml || true
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: pytest-report.xml
+
+  # ==========================================
+  # JOB 2 : BUILD
+  # ==========================================
+  build:
+    name: Build
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Vérification dépendances
+        run: |
+          pip install -r requirements.txt
+          echo "Dependencies OK"
+
+      - name: Vérification fichiers
+        run: |
+          ls -la
+          test -f main.py && echo "main.py présent" || (echo "main.py manquant" && exit 1)
+          echo "Files OK"
+
+  # ==========================================
+  # JOB 3 : DEPLOY
+  # ==========================================
+  deploy:
+    name: Deploy to Render
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Déclencher le déploiement Render
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
+            echo "Secret RENDER_DEPLOY_HOOK absent"; exit 1
+          fi
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK"
+          echo "Redéploiement demandé à Render"
+
+      - name: Fin
+        run: |
+          echo "Déploiement Render déclenché. Surveille le dashboard Render."
