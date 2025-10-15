@@ -1,6 +1,9 @@
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from fastapi import HTTPException
+
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as EN_SW
+
 
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
@@ -60,7 +63,6 @@ FR_SW = {
     "le","la","les","un","une","des","et","ou","de","du","au","aux","je","tu","il","elle","nous","vous","ils","elles",
     "ce","ces","cet","cette","dans","sur","pour","pas","ne","n","d","l","en","y","a","est","sont","aujourd","hui",
 }
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS as EN_SW
 STOPWORDS = set(FR_SW) | set(EN_SW)
 
 EMOJI_RE = re.compile(
