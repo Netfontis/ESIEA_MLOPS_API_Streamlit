@@ -252,6 +252,109 @@ def _explain_with_lime(text: str, num_features: int = 10):
     sentiment_pack = _sentiment_from_proba(proba)
     return sentiment_pack["sentiment"], explanation, html
 
+
+# ========= Helpers proba =========
+
+import numpy as np
+
+def getCoreEstimator(modelObj):
+    """
+    Remonte jusqu'à l'estimateur final (grid.best_estimator_, pipeline[-1], etc.)
+    """
+    seen = set()
+    m = modelObj
+
+    while True:
+        key = id(m)
+        if key in seen:
+            break
+        seen.add(key)
+
+        if hasattr(m, "best_estimator_") and m.best_estimator_ is not None:
+            m = m.best_estimator_
+            continue
+
+        if hasattr(m, "named_steps"):
+            try:
+                # Pipeline sklearn
+                last = list(m.named_steps.values())[-1]
+                m = last
+                continue
+            except Exception:
+                pass
+
+        if hasattr(m, "steps"):
+            try:
+                m = m.steps[-1][1]
+                continue
+            except Exception:
+                pass
+
+        if hasattr(m, "estimator"):
+            m = m.estimator
+            continue
+
+        if hasattr(m, "base_estimator"):
+            m = m.base_estimator
+            continue
+
+        break
+
+    return m
+
+
+def scoresToProba(scores):
+    s = np.asarray(scores, dtype=float)
+
+    # Binaire : score de marge → sigmoid
+    if s.ndim == 1:
+        p1 = 1.0 / (1.0 + np.exp(-s))
+        return np.c_[1.0 - p1, p1]
+
+    # Multi-classes : softmax
+    s = s - np.max(s, axis=1, keepdims=True)
+    e = np.exp(s)
+    return e / np.sum(e, axis=1, keepdims=True)
+
+
+def predictProbaSafely(modelObj, X):
+    """
+    Renvoie des probabilités pour tout type de wrapper sklearn :
+    - utilise predict_proba si dispo
+    - sinon decision_function + (sigmoid/softmax)
+    - sinon fallback 0/1 à partir de predict()
+    """
+    core = getCoreEstimator(modelObj)
+
+    if hasattr(modelObj, "predict_proba"):
+        return modelObj.predict_proba(X)
+
+    if hasattr(modelObj, "decision_function"):
+        return scoresToProba(modelObj.decision_function(X))
+
+    if hasattr(core, "predict_proba"):
+        return core.predict_proba(X)
+
+    if hasattr(core, "decision_function"):
+        return scoresToProba(core.decision_function(X))
+
+    # Dernier recours : probas déterministes (0/1) via predict()
+    if hasattr(modelObj, "predict"):
+        y = modelObj.predict(X)
+    else:
+        y = core.predict(X)
+
+    classes = getattr(modelObj, "classes_", getattr(core, "classes_", np.array([0, 1])))
+    classes = list(classes)
+
+    out = np.zeros((len(y), len(classes)))
+    for i, yi in enumerate(y):
+        j = classes.index(yi)
+        out[i, j] = 1.0
+
+    return out
+
+
 # =========================
 # 5) Chargement des modèles (startup)
 # =========================
@@ -304,7 +407,6 @@ def health():
 def predict(req: TweetRequest):
     _ensure_loaded()
 
-    # 1) Entrée propre
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Le texte ne peut pas être vide.")
@@ -312,7 +414,7 @@ def predict(req: TweetRequest):
     cleaned = preprocess_text(text)
     X = vectorizer.transform([cleaned])
 
-    # 2) Sécurité : compatibilité vectorizer ↔ modèle
+    # Sécurité dims
     n_vec = X.shape[1]
     n_mod = getattr(model, "n_features_in_", None)
     if n_mod is not None and n_vec != n_mod:
@@ -323,35 +425,21 @@ def predict(req: TweetRequest):
                     f"créé avec CE modèle.")
         )
 
-    # 3) Probabilités robustes (fallback si pas de predict_proba)
+    # Probabilités robustes (gère les wrappers)
     try:
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X)
-        elif hasattr(model, "decision_function"):
-            scores = model.decision_function(X)
-            import numpy as np  # au cas où
-            if np.ndim(scores) == 1:
-                # binaire : sigmoid
-                p_pos = 1.0 / (1.0 + np.exp(-scores))
-                proba = np.c_[1.0 - p_pos, p_pos]
-            else:
-                # multi-classes : softmax
-                s = scores - np.max(scores, axis=1, keepdims=True)
-                e = np.exp(s)
-                proba = e / np.sum(e, axis=1, keepdims=True)
-        else:
-            raise RuntimeError("Le modèle n’expose ni predict_proba ni decision_function.")
+        proba = predictProbaSafely(model, X)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Échec predict: {type(e).__name__}: {e}")
 
-    # 4) Mapping vers ta réponse
     pack = _sentiment_from_proba(proba)
+
     return PredictionResponse(
         sentiment=pack["sentiment"],
         confidence=round(pack["confidence"], 6),
         probability_positive=round(pack["p_pos"], 6),
         probability_negative=round(pack["p_neg"], 6),
     )
+
 
 @app.post("/explain", response_model=ExplanationResponse, summary="Explicabilité LIME")
 def explain(req: TweetRequest):
