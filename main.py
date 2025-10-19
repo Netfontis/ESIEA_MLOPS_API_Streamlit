@@ -129,6 +129,42 @@ def preprocess_text(text: str) -> str:
 
     return " ".join(tokens)
 
+def _sigmoid(z):
+    z = np.asarray(z, dtype=float)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def _softmax(scores):
+    s = np.asarray(scores, dtype=float)
+    s = s - np.max(s, axis=1, keepdims=True)  # stabilité num.
+    e = np.exp(s)
+    return e / np.sum(e, axis=1, keepdims=True)
+
+def _predict_proba_safely(X):
+    """
+    Retourne des probabilités même si le modèle n'expose pas predict_proba,
+    en se rabattant sur decision_function.
+    """
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)
+
+    if hasattr(model, "decision_function"):
+        scores = model.decision_function(X)
+
+        # binaire → 1 colonne ou 2 colonnes selon l’estimateur
+        if np.ndim(scores) == 1:
+            # marge binaire, transforme en proba via sigmoid
+            p_pos = _sigmoid(scores)
+            return np.c_[1.0 - p_pos, p_pos]
+
+        # multi-classes → softmax
+        return _softmax(scores)
+
+    raise HTTPException(
+        status_code=500,
+        detail="Le modèle n’expose ni predict_proba ni decision_function."
+    )
+
+
 # =========================
 # 4) Utils prédiction / LIME
 # =========================
@@ -267,14 +303,48 @@ def health():
 @app.post("/predict", response_model=PredictionResponse, summary="Prédiction de sentiment")
 def predict(req: TweetRequest):
     _ensure_loaded()
+
+    # 1) Entrée propre
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Le texte ne peut pas être vide.")
 
     cleaned = preprocess_text(text)
     X = vectorizer.transform([cleaned])
-    proba = model.predict_proba(X)
 
+    # 2) Sécurité : compatibilité vectorizer ↔ modèle
+    n_vec = X.shape[1]
+    n_mod = getattr(model, "n_features_in_", None)
+    if n_mod is not None and n_vec != n_mod:
+        raise HTTPException(
+            status_code=500,
+            detail=(f"Incompatibilité vectorizer/modèle: X a {n_vec} features, "
+                    f"le modèle en attend {n_mod}. Utilise le vectorizer "
+                    f"créé avec CE modèle.")
+        )
+
+    # 3) Probabilités robustes (fallback si pas de predict_proba)
+    try:
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)
+        elif hasattr(model, "decision_function"):
+            scores = model.decision_function(X)
+            import numpy as np  # au cas où
+            if np.ndim(scores) == 1:
+                # binaire : sigmoid
+                p_pos = 1.0 / (1.0 + np.exp(-scores))
+                proba = np.c_[1.0 - p_pos, p_pos]
+            else:
+                # multi-classes : softmax
+                s = scores - np.max(scores, axis=1, keepdims=True)
+                e = np.exp(s)
+                proba = e / np.sum(e, axis=1, keepdims=True)
+        else:
+            raise RuntimeError("Le modèle n’expose ni predict_proba ni decision_function.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Échec predict: {type(e).__name__}: {e}")
+
+    # 4) Mapping vers ta réponse
     pack = _sentiment_from_proba(proba)
     return PredictionResponse(
         sentiment=pack["sentiment"],
