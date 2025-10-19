@@ -547,6 +547,11 @@ def health():
     ok_vect  = vectorizer is not None
     ok_lime  = lime_explainer is not None
     details = {
+        "model_loaded": ok_model,
+        "vectorizer_loaded": ok_vect,
+        "lime_loaded": ok_lime,
+        "class_names": class_names,
+        "model_path": MODEL_PATH,
         "model_raw_type": model_raw_type,
         "model_resolved_type": model_resolved_type,
         "model_has_predict_proba": hasattr(model, "predict_proba") or hasattr(get_core_estimator(model), "predict_proba"),
@@ -556,6 +561,7 @@ def health():
         "vectorizer_type": type(vectorizer).__name__ if vectorizer is not None else None,
         "vectorizer_vocab_size": (len(getattr(vectorizer, "vocabulary_", {})) if vectorizer is not None else None),
         "load_warning": load_warning,
+        "vectorizer_path": VECT_PATH
     }
     status = "ok" if all([ok_model, ok_vect, ok_lime]) else "degraded"
     return {"status": status, "details": details}
