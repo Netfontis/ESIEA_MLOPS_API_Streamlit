@@ -46,8 +46,8 @@ app = FastAPI(title="🎓 API Sentiment",
               description="API de classification de sentiment avec LIME",
               version="1.0.0")
 
-MODEL_PATH = os.getenv("MODEL_PATH", "sentiment_model.joblib")
-VECT_PATH  = os.getenv("VECT_PATH", "tfidf_vectorizer.joblib")
+MODEL_PATH = os.getenv("MODEL_PATH", "api_artifacts/sentiment_model.joblib")
+VECT_PATH  = os.getenv("VECT_PATH", "api_artifacts/tfidf_vectorizer.joblib")
 
 model = None
 vectorizer = None

@@ -1,0 +1,6 @@
+{
+    "model_name": "sentiment_model",
+    "accuracy": 0.77,
+    "f1_score": 0.77,
+    "additional_info": null
+}
