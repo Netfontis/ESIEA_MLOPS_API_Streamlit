@@ -354,30 +354,184 @@ def predictProbaSafely(modelObj, X):
 
     return out
 
+# --- Helpers d'empaquetage & proba ---
+
+import numpy as np
+from typing import Any
+
+def unwrap_model(obj: Any) -> Any:
+    """
+    Tente d'extraire l'estimateur "coeur" depuis différents empaquetages :
+    - dict: clés usuelles ('model', 'pipeline', 'estimator', 'clf', 'classifier') ou 1er objet ayant predict/_proba
+    - tuple/list: dernier élément ou celui qui a predict/_proba
+    - Pipeline/GridSearchCV/etc: on laisse tel quel, géré plus bas par get_core_estimator()
+    """
+    m = obj
+
+    # dict
+    if isinstance(m, dict):
+        for key in ("model", "pipeline", "estimator", "clf", "classifier"):
+            if key in m:
+                return m[key]
+        # sinon, 1ère valeur ressemblant à un estimateur
+        for v in m.values():
+            if hasattr(v, "predict") or hasattr(v, "predict_proba") or hasattr(v, "decision_function"):
+                return v
+        return m
+
+    # tuple / list
+    if isinstance(m, (list, tuple)):
+        # on préfère un objet ayant predict/_proba; sinon le dernier
+        pick = None
+        for v in m:
+            if hasattr(v, "predict") or hasattr(v, "predict_proba") or hasattr(v, "decision_function"):
+                pick = v
+        return pick if pick is not None else m[-1]
+
+    return m
+
+
+def get_core_estimator(model_obj: Any) -> Any:
+    """
+    Remonte jusqu'à l'estimateur final à l'intérieur d'un wrapper (Pipeline, GridSearchCV, OneVsRest, etc.).
+    """
+    seen = set()
+    m = model_obj
+
+    while True:
+        if id(m) in seen:
+            break
+        seen.add(id(m))
+
+        # GridSearchCV / RandomizedSearchCV
+        if hasattr(m, "best_estimator_") and m.best_estimator_ is not None:
+            m = m.best_estimator_
+            continue
+
+        # Pipeline sklearn
+        if hasattr(m, "named_steps"):
+            try:
+                m = list(m.named_steps.values())[-1]
+                continue
+            except Exception:
+                pass
+        if hasattr(m, "steps"):
+            try:
+                m = m.steps[-1][1]
+                continue
+            except Exception:
+                pass
+
+        # méta-estimateurs
+        if hasattr(m, "estimator"):
+            m = m.estimator
+            continue
+        if hasattr(m, "base_estimator"):
+            m = m.base_estimator
+            continue
+
+        break
+
+    return m
+
+
+def scores_to_proba(scores: Any) -> np.ndarray:
+    s = np.asarray(scores, dtype=float)
+    if s.ndim == 1:  # binaire
+        p1 = 1.0 / (1.0 + np.exp(-s))  # sigmoid
+        return np.c_[1.0 - p1, p1]
+    # multi-classes : softmax
+    s = s - np.max(s, axis=1, keepdims=True)
+    e = np.exp(s)
+    return e / np.sum(e, axis=1, keepdims=True)
+
+
+def predict_proba_safely(model_obj: Any, X) -> np.ndarray:
+    """
+    Renvoie des probabilités, quel que soit le wrapper :
+    - predict_proba si dispo
+    - sinon decision_function → proba (sigmoid/softmax)
+    - sinon fallback 0/1 via predict()
+    """
+    core = get_core_estimator(model_obj)
+
+    # direct sur l'objet haut-niveau
+    if hasattr(model_obj, "predict_proba"):
+        return model_obj.predict_proba(X)
+    if hasattr(model_obj, "decision_function"):
+        return scores_to_proba(model_obj.decision_function(X))
+
+    # sinon sur l'estimateur coeur
+    if hasattr(core, "predict_proba"):
+        return core.predict_proba(X)
+    if hasattr(core, "decision_function"):
+        return scores_to_proba(core.decision_function(X))
+
+    # dernier recours : proba déterministes depuis predict()
+    target = model_obj if hasattr(model_obj, "predict") else core
+    if not hasattr(target, "predict"):
+        raise RuntimeError("Aucune méthode predict/predict_proba/decision_function trouvée sur le modèle chargé.")
+
+    y = target.predict(X)
+    classes = getattr(model_obj, "classes_", getattr(core, "classes_", np.array([0, 1])))
+    classes = list(classes)
+
+    out = np.zeros((len(y), len(classes)))
+    for i, yi in enumerate(y):
+        j = classes.index(yi)
+        out[i, j] = 1.0
+    return out
+
 
 # =========================
 # 5) Chargement des modèles (startup)
 # =========================
 @app.on_event("startup")
 def _load_artifacts():
-    global model, vectorizer, lime_explainer, class_names
+    global model, vectorizer, lime_explainer, class_names, load_warning, model_raw_type, model_resolved_type
+    load_warning = None
+    model_raw_type = None
+    model_resolved_type = None
+
     try:
-        model = joblib.load(MODEL_PATH)
-        vectorizer = joblib.load(VECT_PATH)
+        import joblib, os
+        from lime.lime_text import LimeTextExplainer
 
-        # class_names pour LIME
-        if hasattr(model, "classes_"):
-            class_names = [str(c) for c in model.classes_]
+        # 1) charge brut
+        raw = joblib.load(MODEL_PATH)
+        model_raw_type = type(raw).__name__
+
+        # 2) unwrap si dict/tuple/etc.
+        unwrapped = unwrap_model(raw)
+        model = unwrapped
+        model_resolved_type = type(model).__name__
+
+        # 3) vectorizer (si fourni via VECT_PATH)
+        if VECT_PATH and os.path.exists(VECT_PATH):
+            vectorizer = joblib.load(VECT_PATH)
         else:
-            class_names = ["negative", "positive"]  # fallback
+            vectorizer = None  # pipeline possible
 
-        lime_explainer = LimeTextExplainer(
-            class_names=class_names,
-            split_expression=WORD_RE  # cohérent avec preprocess
-        )
-        print("[STARTUP] Modèles chargés ✅")
+        # 4) classes
+        class_names_local = getattr(model, "classes_", None)
+        if class_names_local is None and hasattr(get_core_estimator(model), "classes_"):
+            class_names_local = getattr(get_core_estimator(model), "classes_", None)
+        class_names[:] = [str(c) for c in (class_names_local if class_names_local is not None else ["negative", "positive"])]
+
+        # 5) LIME
+        lime_explainer = LimeTextExplainer(class_names=class_names, split_expression=WORD_RE)
+
+        # 6) avertissement si le "modèle" ressemble à un objet non-estimateur
+        suspicious = {"Series", "DataFrame", "ndarray"}
+        if model_resolved_type in suspicious:
+            load_warning = (f"Le fichier MODEL_PATH contient un objet {model_resolved_type} — ce n'est pas un estimateur. "
+                            f"Vérifie l'artefact sauvegardé (attendu: Pipeline/Classifier).")
+
+        print(f"[STARTUP] raw={model_raw_type}, resolved={model_resolved_type}, warning={load_warning}")
+
     except Exception as e:
-        print(f"[STARTUP] Échec de chargement des artefacts ❌ : {e}")
+        print(f"[STARTUP] Échec de chargement: {e}")
+        raise
 
 # =========================
 # 6) Endpoints requis
@@ -393,12 +547,15 @@ def health():
     ok_vect  = vectorizer is not None
     ok_lime  = lime_explainer is not None
     details = {
-        "model_loaded": ok_model,
-        "vectorizer_loaded": ok_vect,
-        "lime_loaded": ok_lime,
-        "class_names": class_names,
-        "model_path": MODEL_PATH,
-        "vectorizer_path": VECT_PATH
+        "model_raw_type": model_raw_type,
+        "model_resolved_type": model_resolved_type,
+        "model_has_predict_proba": hasattr(model, "predict_proba") or hasattr(get_core_estimator(model), "predict_proba"),
+        "model_has_decision_function": hasattr(model, "decision_function") or hasattr(get_core_estimator(model), "decision_function"),
+        "model_has_predict": hasattr(model, "predict") or hasattr(get_core_estimator(model), "predict"),
+        "model_n_features_in": getattr(get_core_estimator(model), "n_features_in_", None),
+        "vectorizer_type": type(vectorizer).__name__ if vectorizer is not None else None,
+        "vectorizer_vocab_size": (len(getattr(vectorizer, "vocabulary_", {})) if vectorizer is not None else None),
+        "load_warning": load_warning,
     }
     status = "ok" if all([ok_model, ok_vect, ok_lime]) else "degraded"
     return {"status": status, "details": details}
@@ -412,34 +569,39 @@ def predict(req: TweetRequest):
         raise HTTPException(status_code=400, detail="Le texte ne peut pas être vide.")
 
     cleaned = preprocess_text(text)
-    X = vectorizer.transform([cleaned])
 
-    # Sécurité dims
-    n_vec = X.shape[1]
-    n_mod = getattr(model, "n_features_in_", None)
-    if n_mod is not None and n_vec != n_mod:
-        raise HTTPException(
-            status_code=500,
-            detail=(f"Incompatibilité vectorizer/modèle: X a {n_vec} features, "
-                    f"le modèle en attend {n_mod}. Utilise le vectorizer "
-                    f"créé avec CE modèle.")
-        )
+    # pipeline ou vectorizer séparé
+    if vectorizer is None and (hasattr(model, "transform") or hasattr(model, "predict_proba")):
+        # pipeline (le modèle gère la vectorisation)
+        try:
+            proba = predict_proba_safely(model, [cleaned])
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Échec predict (pipeline): {type(e).__name__}: {e}")
+    else:
+        # vectorizer + modèle séparés
+        X = vectorizer.transform([cleaned])
 
-    # Probabilités robustes (gère les wrappers)
-    try:
-        proba = predictProbaSafely(model, X)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Échec predict: {type(e).__name__}: {e}")
+        n_vec = X.shape[1]
+        n_mod = getattr(get_core_estimator(model), "n_features_in_", None)
+        if n_mod is not None and n_vec != n_mod:
+            raise HTTPException(
+                status_code=500,
+                detail=(f"Incompatibilité vectorizer/modèle: X a {n_vec} features, "
+                        f"le modèle en attend {n_mod}. Utilise le vectorizer "
+                        f"créé avec CE modèle.")
+            )
+        try:
+            proba = predict_proba_safely(model, X)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Échec predict: {type(e).__name__}: {e}")
 
     pack = _sentiment_from_proba(proba)
-
     return PredictionResponse(
         sentiment=pack["sentiment"],
         confidence=round(pack["confidence"], 6),
         probability_positive=round(pack["p_pos"], 6),
         probability_negative=round(pack["p_neg"], 6),
     )
-
 
 @app.post("/explain", response_model=ExplanationResponse, summary="Explicabilité LIME")
 def explain(req: TweetRequest):
