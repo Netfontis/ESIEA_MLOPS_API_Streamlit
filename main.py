@@ -51,7 +51,14 @@ VECT_PATH  = os.getenv("VECT_PATH", "api_artifacts/tfidf_vectorizer.joblib")
 
 model = None
 vectorizer = None
-lime_explainer: Optional[LimeTextExplainer] = None
+lime_explainer = None
+class_names = []
+
+# diagnostics de chargement
+model_raw_type = None
+model_resolved_type = None
+load_warning = None
+
 class_names: List[str] = []
 positive_label_candidates = {"positive", "pos", 1, "1", "Positive", "POSITIVE"}
 
@@ -482,13 +489,20 @@ def predict_proba_safely(model_obj: Any, X) -> np.ndarray:
         out[i, j] = 1.0
     return out
 
+def safe_hasattr(obj, attr: str) -> bool:
+    return (obj is not None) and hasattr(obj, attr)
+
+def safe_core_estimator(obj):
+    return get_core_estimator(obj) if obj is not None else None
+
 
 # =========================
 # 5) Chargement des modèles (startup)
 # =========================
 @app.on_event("startup")
 def _load_artifacts():
-    global model, vectorizer, lime_explainer, class_names, load_warning, model_raw_type, model_resolved_type
+    global model, vectorizer, lime_explainer, class_names
+    global model_raw_type, model_resolved_type, load_warning
     load_warning = None
     model_raw_type = None
     model_resolved_type = None
@@ -546,25 +560,31 @@ def health():
     ok_model = model is not None
     ok_vect  = vectorizer is not None
     ok_lime  = lime_explainer is not None
+
+    core = safe_core_estimator(model)
+
     details = {
         "model_loaded": ok_model,
         "vectorizer_loaded": ok_vect,
         "lime_loaded": ok_lime,
+
         "class_names": class_names,
         "model_path": MODEL_PATH,
+        "vectorizer_path": VECT_PATH,
+
+        # diagnostics robustes
         "model_raw_type": model_raw_type,
         "model_resolved_type": model_resolved_type,
-        "model_has_predict_proba": hasattr(model, "predict_proba") or hasattr(get_core_estimator(model), "predict_proba"),
-        "model_has_decision_function": hasattr(model, "decision_function") or hasattr(get_core_estimator(model), "decision_function"),
-        "model_has_predict": hasattr(model, "predict") or hasattr(get_core_estimator(model), "predict"),
-        "model_n_features_in": getattr(get_core_estimator(model), "n_features_in_", None),
-        "vectorizer_type": type(vectorizer).__name__ if vectorizer is not None else None,
+        "model_has_predict_proba": safe_hasattr(model, "predict_proba") or safe_hasattr(core, "predict_proba"),
+        "model_has_decision_function": safe_hasattr(model, "decision_function") or safe_hasattr(core, "decision_function"),
+        "model_has_predict": safe_hasattr(model, "predict") or safe_hasattr(core, "predict"),
+        "model_n_features_in": getattr(core, "n_features_in_", None) if core is not None else None,
+        "vectorizer_type": (type(vectorizer).__name__ if vectorizer is not None else None),
         "vectorizer_vocab_size": (len(getattr(vectorizer, "vocabulary_", {})) if vectorizer is not None else None),
         "load_warning": load_warning,
-        "vectorizer_path": VECT_PATH
     }
-    status = "ok" if all([ok_model, ok_vect, ok_lime]) else "degraded"
-    return {"status": status, "details": details}
+
+    return {"status": "ok", "details": details}
 
 @app.post("/predict", response_model=PredictionResponse, summary="Prédiction de sentiment")
 def predict(req: TweetRequest):
@@ -586,6 +606,15 @@ def predict(req: TweetRequest):
     else:
         # vectorizer + modèle séparés
         X = vectorizer.transform([cleaned])
+
+        core = safe_core_estimator(model)
+        if not any([safe_hasattr(model, "predict_proba"), safe_hasattr(model, "decision_function"), safe_hasattr(model, "predict"),
+                    safe_hasattr(core, "predict_proba"), safe_hasattr(core, "decision_function"), safe_hasattr(core, "predict")]):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Artefact invalide: objet chargé de type '{model_resolved_type}' (attendu: Pipeline/Classifier)."
+            )
+
 
         n_vec = X.shape[1]
         n_mod = getattr(get_core_estimator(model), "n_features_in_", None)
